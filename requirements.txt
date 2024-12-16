@@ -1,4 +1,5 @@
-gymnasium~=0.29.1
-numpy~=1.26.4
-pygame~=2.5.2
-setuptools~=68.2.0
+gymnasium
+numpy
+pygame
+setuptools
+torch
