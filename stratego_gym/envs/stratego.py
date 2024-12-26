@@ -54,6 +54,11 @@ SELECTION_PHASE = 1
 MOVEMENT_PHASE = 2
 GAME_OVER = 3
 
+GAME_CONFIG_4x4 = {
+    "game_map": MAP_4x4,
+    "pieces": LIMITED_PIECE_SET2
+}
+
 # PyGame Rendering Constants
 WINDOW_SIZE = 800
 
@@ -70,9 +75,12 @@ def get_random_choice(valid_items):
 class StrategoEnv(Env):
     metadata = {"render_modes": [None, "human"]}
 
-    def __init__(self, game_map=MAP_4x4, render_mode=None):
+    def __init__(self, game_config=None, render_mode=None):
 
-        self.game_map = np.copy(game_map)
+        if game_config is None:
+            self.game_config = GAME_CONFIG_4x4
+
+        self.game_map = np.copy(self.game_config["game_map"])
         self.game_phase = DEPLOYMENT_PHASE
         self.render_mode = render_mode
 
@@ -144,7 +152,7 @@ class StrategoEnv(Env):
     def generate_board(self):
         self.board = np.copy(self.game_map)
         if self.game_map.shape == (4, 4):
-            self.pieces = np.array(list(LIMITED_PIECE_SET2))
+            self.pieces = np.array(list(self.game_config["pieces"]))
             self.movable_pieces = self.pieces[~np.isin(self.pieces, [FLAG, BOMB])]
 
             # 1st channel is unmoved, 2nd channel is moved, 3rd channel is revealed
@@ -244,7 +252,7 @@ class StrategoEnv(Env):
         - The last selected piece (last_selected). This is only valid if the game phase is MOVEMENT_PHASE,
           and it corresponds to the last piece selected by the current player.
         """
-        return {"cur_player": self.player, "cur_board": np.copy(self.board), "pieces": self.pieces,
+        return {"cur_player": np.array(self.player), "cur_board": np.copy(self.board), "pieces": self.pieces,
                 "board_shape": self.board.shape, "num_pieces": len(self.pieces),
                 "total_moves": self.draw_conditions["total_moves"],
                 "moves_since_attack": self.draw_conditions["moves_since_attack"],
@@ -253,13 +261,13 @@ class StrategoEnv(Env):
                 self.p1_last_selected if self.player == 1 else self.p2_last_selected}
 
     def step(self, action: tuple):
+        # Convert ndarray action to tuple if necessary
+        if isinstance(action, np.ndarray):
+            action = tuple(action.squeeze())
+
         valid, msg = self.validate_coord(action)
         if not valid:
             raise ValueError(msg)
-
-        # Convert ndarray action to tuple if necessary
-        if isinstance(action, np.ndarray):
-            action = tuple(action)
 
         if self.game_phase == DEPLOYMENT_PHASE:
             if self.valid_spots_to_place()[action] == 0:

@@ -2,6 +2,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from stratego_gym.envs.stratego import GAME_CONFIG_4x4, FLAG, BOMB
+
 class ConvResBlock(nn.Module):
     def __init__(self, in_channels, out_channels, stride=1):
         super(ConvResBlock, self).__init__()
@@ -74,146 +76,91 @@ class PyramidModule(nn.Module):
         return x
 
 class DeepNashNet(nn.Module):
-    def __init__(self, inner_channels, outer_channels, N, M):
+    def __init__(self, inner_channels, outer_channels, N, M, game_config=None):
         super(DeepNashNet, self).__init__()
+
         self.pyramid = PyramidModule(inner_channels, outer_channels, N, M)
         self.deployment_head = nn.Sequential(
             PyramidModule(inner_channels, outer_channels, 1, 0),
             nn.Conv2d(outer_channels,1, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Flatten(),
-            nn.Softmax(dim=-1)
+            nn.Flatten(start_dim=-3, end_dim=-1),
         )
         self.selection_head = nn.Sequential(
             PyramidModule(inner_channels, outer_channels, 1, 0),
             nn.Conv2d(outer_channels,1, kernel_size=3, padding=1),
-            nn.Flatten(),
-            nn.Softmax(dim=-1),
+            nn.Flatten(start_dim=-3, end_dim=-1),
         )
         self.movement_head = nn.Sequential(
             PyramidModule(inner_channels, outer_channels, 1, 0),
             nn.Conv2d(outer_channels,1, kernel_size=3, padding=1),
-            nn.Flatten(),
-            nn.Softmax(dim=-1)
+            nn.Flatten(start_dim=-3, end_dim=-1),
         )
         self.value_head = nn.Sequential(
             PyramidModule(inner_channels, outer_channels, 0, 0),
             nn.Conv2d(outer_channels,1, kernel_size=3, padding=1),
-            nn.Flatten(),
+            nn.Flatten(start_dim=-3, end_dim=-1),
             nn.LazyLinear(1)
         )
 
-    def forward(self, obs, env_info):
-        # Assumptions about env_info:
-        # - env_info["board_shape"] = (H, W)
-        # - env_info["num_pieces"] = number of possible piece types
-        # - env_info["moves_since_attack"] = shape (B,) array of floats or ints
-        # - env_info["cur_board"] = list/array of length B, each element is a (H, W) array representing the board
-        # - env_info["last_selected"] = list of length B, each either None or a tuple (r, c)
-        # - env_info["pieces"] = array of shape (num_pieces,) or something broadcastable,
-        #   containing unique identifiers for each piece type.
+        self.device = next(self.parameters()).device
 
-        device = obs.device
-        B = obs.shape[0]
-        H, W = env_info["board_shape"][0]
-        num_pieces = env_info["num_pieces"][0]
+        if game_config is None:
+            game_config = GAME_CONFIG_4x4
 
-        # Convert moves_since_attack to tensor
-        moves_since_attack = torch.tensor(env_info["moves_since_attack"], dtype=torch.float32, device=device)
+        self.pieces = np.array(list(game_config['pieces']))
+        invalid_piece_ids = [FLAG, BOMB]  # Define invalid piece IDs
+        valid_piece_ids = np.setdiff1d(self.pieces, invalid_piece_ids)  # Exclude invalid pieces
+        self.valid_mask = torch.tensor([id_ in valid_piece_ids for id_ in self.pieces], dtype=torch.bool, device=self.device,
+                                       requires_grad=False)  # Create a mask for valid piece IDs
 
-        # Stack cur_board into a (B, H, W) tensor
-        # Originally cur_board might be a list of np arrays. We stack and then convert to torch.
-        cur_board = np.stack(env_info["cur_board"], axis=0)  # shape: (B, H, W)
-        cur_board = torch.tensor(cur_board, device=device)
+    def forward(self, state, action_mask):
+        # state shape: (..., C, H, W), mask shape: (..., H, W)
+        if isinstance(state, np.ndarray):
+            state = torch.from_numpy(state).to(self.device)
+        state = state.float()
 
-        # last_selected: list of length B, each None or (r, c)
-        last_selected = env_info["last_selected"]
+        if isinstance(action_mask, np.ndarray):
+            action_mask = torch.from_numpy(action_mask).to(self.device)
 
-        # pieces: ensure it's a tensor of shape (B, num_pieces) if needed.
-        # If pieces is just a 1D array of length num_pieces (same for all), broadcast it:
-        pieces_list = env_info["pieces"]  # shape: (B,), each element is e.g. (num_pieces,)
-        pieces = np.stack(pieces_list, axis=0)  # Now pieces is (B, num_pieces)
-        pieces = torch.tensor(pieces, device=device)
+        num_pieces = self.pieces.size
 
         # Pass observation through the pyramid (feature extractor)
-        board_embed = self.pyramid(obs)  # (B, C, H, W)
+        board_embed = self.pyramid(state)  # shape: (..., C, H, W)
 
-        # Create tiled_no_attack: shape (B, 1, H, W)
-        tiled_no_attack = (moves_since_attack / 200.0).view(B, 1, 1, 1).expand(B, 1, H, W)
+        tiled_no_attack = state[..., -4:-3, :, :] # shape: (... 1, H, W)
 
-        # Handle last_selected possibly being None
-        valid_mask = np.array([sel is not None for sel in last_selected])
-        valid_indices = np.where(valid_mask)[0]  # indices of batch elements with a valid selection
+        one_hot_last_selected = state[..., 1:num_pieces + 1, :, :] # shape: (..., num_pieces, H, W)
+        one_hot_last_selected = one_hot_last_selected[..., self.valid_mask, :, :] # shape: (..., num_movable_pieces, H, W)
+        one_hot_last_selected = one_hot_last_selected * state[..., -1:, :, :] # shape: (..., num_movable_pieces, H, W)
 
-        # Initialize last_piece_type with a default invalid value (e.g., -1)
-        last_piece_type = torch.full((B,), fill_value=-1, dtype=cur_board.dtype, device=device)
+        # Calculate game phase tensors
+        finished_deploying = state[..., -3:-2, :, :] # shape: (..., 1, H, W)
+        moving_piece = state[..., -2:-1, :, :] # shape: (..., 1, H, W)
+        game_phase_tensor = (2 * moving_piece + finished_deploying).long()
+        game_phase_tensor = game_phase_tensor.flatten(start_dim=-2) # shape (..., 1, H * W)
 
-        if len(valid_indices) > 0:
-            # Extract rows and cols for valid entries
-            valid_rows = np.array([last_selected[i][0] for i in valid_indices])
-            valid_cols = np.array([last_selected[i][1] for i in valid_indices])
+        # Compute policies -> shape: (..., 1 * H * W)
+        deployment_logits = self.deployment_head(board_embed)
+        selection_logits = self.selection_head(torch.cat((board_embed, tiled_no_attack), dim=-3))
+        movement_logits = self.movement_head(torch.cat((board_embed, tiled_no_attack, one_hot_last_selected), dim=-3))
 
-            # Convert to torch tensors
-            valid_indices_t = torch.tensor(valid_indices, dtype=torch.long, device=device)
-            rows_t = torch.tensor(valid_rows, dtype=torch.long, device=device)
-            cols_t = torch.tensor(valid_cols, dtype=torch.long, device=device)
+        all_logits = torch.stack([deployment_logits, selection_logits, movement_logits], dim=-2) # shape: (..., 3, 1 * H * W)
+        logits = torch.gather(all_logits, dim=-2, index=game_phase_tensor) # shape: (..., 1, 1 * H * W)
+        logits = torch.squeeze(logits, dim=-2) # shape: (..., H * W)
 
-            # Index cur_board for valid entries
-            selected_pieces = cur_board[valid_indices_t, rows_t, cols_t]
-            last_piece_type[valid_indices_t] = selected_pieces
+        # Action Masking
+        action_mask = action_mask.flatten(start_dim=-2, end_dim=-1).bool() # shape: (..., H * W)
+        masked_logits = torch.where(action_mask, logits, -torch.inf)
+        masked_policy = nn.functional.softmax(masked_logits, dim=-1)
+        masked_log_probs = nn.functional.log_softmax(masked_logits, dim=-1)
 
-        # Create one_hot_last_selected: (B, num_pieces, H, W)
-        one_hot_last_selected = torch.zeros((B, num_pieces, H, W), device=device)
+        # Compute value -> shape: (..., 1)
+        value = self.value_head(torch.cat((board_embed,
+                                          tiled_no_attack * finished_deploying * moving_piece,
+                                          one_hot_last_selected * moving_piece), dim=-3))
 
-        # Find the piece indices for each last_piece_type
-        # Compare pieces and last_piece_type
-        # shapes: pieces: (B, num_pieces), last_piece_type: (B,)
-        match = (pieces == last_piece_type.unsqueeze(1))
-        # nonzero returns (batch_idx, piece_idx) for matches
-        batch_idx, piece_idx = match.nonzero(as_tuple=True)
-
-        # For those with valid last_selected, we have their (row, col)
-        # Extract valid (row, col) again in torch
-        if len(valid_indices) > 0:
-            valid_rows_t = torch.tensor([ls[0] for ls in last_selected if ls is not None], device=device,
-                                        dtype=torch.long)
-            valid_cols_t = torch.tensor([ls[1] for ls in last_selected if ls is not None], device=device,
-                                        dtype=torch.long)
-
-            # Now, batch_idx is in ascending order of batches and should match the order of valid entries
-            # We can directly use batch_idx to index into valid_rows_t and valid_cols_t
-            # Note: match.nonzero() returns results in ascending order, so batch_idx corresponds to the sorted order of those batches
-            # valid_indices_t was also sorted. Both should align as long as last_piece_type matches one piece uniquely.
-            # To be safe, we can map batch_idx back to the index in valid_indices.
-            # We know last_piece_type is unique per environment selection, so there should be a one-to-one mapping.
-            # Let's create a dictionary from batch index to position in valid_indices:
-            valid_idx_map = {v: i for i, v in enumerate(valid_indices)}
-            # Create a mapping tensor for batch_idx to row in valid_rows_t
-            map_positions = torch.tensor([valid_idx_map[int(b.item())] for b in batch_idx], device=device,
-                                         dtype=torch.long)
-
-            # Now use map_positions to index valid_rows_t and valid_cols_t
-            one_hot_last_selected[batch_idx, piece_idx, valid_rows_t[map_positions], valid_cols_t[map_positions]] = 1.0
-
-        # Compute policies
-        deployment_policy = self.deployment_head(board_embed).view(B, 1, H, W)
-        selection_policy = self.selection_head(torch.cat((board_embed, tiled_no_attack), dim=1)).view(B, 1, H, W)
-        movement_policy = self.movement_head(
-            torch.cat((board_embed, tiled_no_attack, one_hot_last_selected), dim=1)).view(B, 1, H, W)
-
-        # Compute values
-        deployment_value = self.value_head(torch.cat((board_embed,
-                                                      torch.zeros_like(tiled_no_attack),
-                                                      torch.zeros_like(one_hot_last_selected)), dim=1))
-        selection_value = self.value_head(torch.cat((board_embed,
-                                                     tiled_no_attack,
-                                                     torch.zeros_like(one_hot_last_selected)), dim=1))
-        movement_value = self.value_head(torch.cat((board_embed,
-                                                    tiled_no_attack,
-                                                    one_hot_last_selected), dim=1))
-
-        return (deployment_policy, deployment_value), (selection_policy, selection_value), (
-        movement_policy, movement_value)
+        return masked_policy, value, masked_log_probs, logits
 
 
 

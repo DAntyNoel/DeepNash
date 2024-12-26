@@ -2,64 +2,71 @@
 Meant as a container for a trained policy. Simplifies the interface for interacting
 with the environment
 """
+from typing import Any, Union
+
 import numpy as np
 import torch
+from tensordict import TensorDictBase
+from tensordict.nn import TensorDictModule
 
 from deep_nash.network import DeepNashNet
-from deep_nash.utils import batch_info_dicts
 
 
-class DeepNashAgent:
-    def __init__(self, device, config=None):
-        if config:
-            pass
-        else:
-            self.policy = DeepNashNet(10, 20, 0, 0) # Default
+class DeepNashAgent(TensorDictModule):
+    def __init__(self, config=None, *args, **kwargs):
+        # TODO: Add Loading from the config at some point. Device should also be a part of the config
+        net = DeepNashNet(10, 20, 0, 0) # Default
 
-        self.policy.to(device)
-        self.device = device
+        # Call TensorDictModule constructor
+        super().__init__(
+            module=net,
+            in_keys=["obs", "action_mask"],  # Input key from TensorDict
+            out_keys=["policy", "value", "log_probs", "logits"]  # Output key to TensorDict
+        )
 
+    def forward(
+        self,
+        tensordict: TensorDictBase,
+        *args,
+        tensordict_out: Union[TensorDictBase, None] = None,
+        **kwargs: Any,
+    ) -> TensorDictBase:
+        # Ensure batch dimensions for obs and action_mask
+        if len(tensordict["obs"].shape) == 3:
+            tensordict["obs"] = tensordict["obs"].unsqueeze(0)
 
-    def get_action(self, obs, mask, info):
-        obs = obs[None, :]
-        mask = mask[None, :]
+        if len(tensordict["action_mask"].shape) == 2:
+            tensordict["action_mask"] = tensordict["action_mask"].unsqueeze(0)
 
-        with torch.no_grad():
-            # Convert observations to tensor
-            obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device)
-            info_batch = batch_info_dicts([info])
+        # Call the parent forward method to compute policy logits
+        tensordict = super().forward(tensordict)
+        shape = tensordict["obs"].shape  # Shape: (B, C, H, W)
 
-            # Forward pass
-            (deploy_policy, _), (select_policy, _), (move_policy, _) = self.policy.forward(obs_t, info_batch)
+        # Sample actions using policy logits
+        sampled_indices = torch.multinomial(tensordict["policy"], num_samples=1, replacement=True)  # Shape: (B, 1)
 
-            # Extract phases and shape info
-            game_phase = info_batch["game_phase"][0]
-            H, W = info_batch["board_shape"][0]
+        # Convert sampled indices into rows and columns
+        rows = sampled_indices // shape[-1]  # Shape: (B, 1)
+        cols = sampled_indices % shape[-1]  # Shape: (B, 1)
 
-            # Convert policies to numpy and select the appropriate policy per environment
-            deploy_np = deploy_policy.squeeze(1).cpu().numpy()
-            select_np = select_policy.squeeze(1).cpu().numpy()
-            move_np = move_policy.squeeze(1).cpu().numpy()
+        # Generate one-hot encodings for rows and columns
+        def one_hot_encode(indices, size):
+            one_hot = torch.zeros(indices.size(0), size, device=indices.device)
+            return one_hot.scatter_(1, indices, 1)
 
-            if info_batch["game_phase"][0] == 0:
-                actions = deploy_np
-            elif info_batch["game_phase"][0] == 1:
-                actions = select_np
-            else:
-                actions = move_np
+        # One-hot encode rows and columns
+        rows_onehot = one_hot_encode(rows, shape[-2])  # One-hot encoding for rows
+        cols_onehot = one_hot_encode(cols, shape[-1])  # One-hot encoding for columns
 
-            # Apply masks and normalize
-            actions *= mask
-            sums = actions.sum(axis=(1, 2), keepdims=True)
-            sums[sums < 1e-8] = 1e-8
-            actions /= sums
+        # Pad one-hot encodings to max(H, W) for rectangular grids
+        max_dim = max(shape[-2], shape[-1])
+        rows_onehot_padded = torch.nn.functional.pad(rows_onehot, (0, max_dim - rows_onehot.shape[1]))
+        cols_onehot_padded = torch.nn.functional.pad(cols_onehot, (0, max_dim - cols_onehot.shape[1]))
 
-            # Sample actions
-            flat_actions = actions.reshape(1, -1)
-            rand_vals = np.random.rand(1)
-            cumulative_sums = np.cumsum(flat_actions, axis=1)
-            sampled_indices = np.argmax(cumulative_sums >= rand_vals[:, None], axis=1)
+        # Stack padded one-hot encodings along a new dimension
+        action_onehot = torch.stack((rows_onehot_padded, cols_onehot_padded), dim=1)  # Shape: (B, 2, max(H, W))
 
-            rows, cols = divmod(sampled_indices, W)
-            action_coords = np.stack([rows, cols], axis=1)
-            return tuple(action_coords[0])
+        # Add the one-hot encoded action to the TensorDict
+        tensordict["action"] = action_onehot
+
+        return tensordict

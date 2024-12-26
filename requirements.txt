@@ -1,5 +1,8 @@
-gymnasium
-numpy
-pygame
-setuptools
+gymnasium~=0.29.0
+numpy~=2.0.2
+pygame~=2.6.1
+setuptools~=75.6.0
 torch
+tensordict~=0.6.2
+reverb~=2.0.1
+torchrl~=0.6.0
