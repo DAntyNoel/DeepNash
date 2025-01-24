@@ -1,47 +1,163 @@
-"""
-Example use of a distributed collector
-======================================
+import time
+from random import random
 
-This example illustrates how a TorchRL collector can be converted into a distributed collector.
-
-This example should create 3 collector instances, 1 local and 2 remote, but 4 instances seem to
-be created. Why?
-"""
-from tensordict.nn import TensorDictModule
+import numpy as np
+import torch
 from torch import nn
-from torchrl._utils import logger as torchrl_logger
-from torchrl.collectors.distributed.ray import RayCollector
+from tensordict.nn import TensorDictModule
+from torchrl.collectors import MultiaSyncDataCollector, SyncDataCollector, MultiSyncDataCollector
+from torchrl.collectors.distributed import RayCollector
+from torchrl.envs import default_info_dict_reader, ParallelEnv
 from torchrl.envs.libs.gym import GymEnv
 
+from deep_nash.network import PyramidModule, ConvResBlock, DeconvResBlock
+from deep_nash.rnad import RNaDSolver, RNaDConfig
+
+
+
+# If deep_nash is an installable package, you can do:
+# ray_init_config = {"runtime_env": {"pip": ["deep_nash"]}}
+
+# If deep_nash is a local folder/package not on PyPI, provide its path:
+# e.g., "py_modules": ["absolute/path/to/deep_nash_folder"]
+ray_init_config = {
+    "runtime_env": {
+        # pick the approach that matches your setup:
+        # "pip": ["deep_nash"],  # if it's installable from PyPI or local file
+        "py_modules": ["/home/abhinav-peri/PycharmProjects/DeepNash/deep_nash",
+                       "/home/abhinav-peri/PycharmProjects/DeepNash/stratego_gym"],  # if local
+    },
+}
+
+from deep_nash import DeepNashAgent  # must be importable on the driver side too
+
+# 1. Create environment factory
+def env_maker(render_mode=None):
+    reader = default_info_dict_reader(["cur_player"])
+    return GymEnv("stratego_gym/Stratego-v0", render_mode=render_mode).set_info_dict_reader(reader)
+
+def evaluate_random(policy: TensorDictModule):
+    env = env_maker().to("cuda")
+    count = 0
+    for _ in range(100):
+        tensordict = env.reset()
+        policy_turn = np.random.choice([True, False])
+        while True:
+            if policy_turn:
+                tensordict = policy(tensordict)
+                tensordict = env.step(tensordict)["next"]
+            else:
+                tensordict["action"] = env.action_spec.sample()
+                tensordict = env.step(tensordict)["next"]
+            if tensordict["terminated"]:
+                count += int(policy_turn)
+                break
+
+    print(f"Win Rate against Random: {count / 100}")
+
+    # env = env_maker(render_mode="human").to("cuda")
+    # tensordict = env.reset()
+    #
+    # # Randomly select whether random or policy goes first
+    # policy_turn = np.random.choice([True, False])
+    #
+    # while True:
+    #     if policy_turn:
+    #         tensordict = policy(tensordict)
+    #         tensordict = env.step(tensordict)["next"]
+    #     else:
+    #         tensordict["action"] = env.action_spec.sample()
+    #         tensordict = env.step(tensordict)["next"]
+    #     env.render()
+    #     time.sleep(0.1)
+    #     if tensordict["terminated"]:
+    #         print(f"Game over! " + ("Policy" if policy_turn else "Random") + " won.")
+    #         tensordict = env.reset()
 
 if __name__ == "__main__":
+    torch.autograd.set_detect_anomaly(True)
 
-    # 1. Create environment factory
-    def env_maker():
-        return GymEnv("Pendulum-v1", device="cpu")
+    # 2. Define a policy
+    policy = DeepNashAgent()
+    env = env_maker()
+    policy(env.reset())
+    policy.to("cuda")
 
-    policy = TensorDictModule(
-        nn.Linear(3, 1), in_keys=["observation"], out_keys=["action"]
+    # # Choose how many remote collectors and vectorized envs you want
+    # num_collectors = 1
+    # num_workers_per_collector = 10
+    #
+    # # frames_per_batch + total_frames
+    # frames_per_batch = 10_000
+    # total_frames = 10_000_000
+    #
+    # # 3. Remote resource config for each actor
+    # remote_configs = {
+    #     "num_cpus": 1,
+    #     "num_gpus": 0.01,
+    #     "memory": 2 * 1024 ** 3,  # 2GB
+    # }
+    #
+    # torchrl_logger.info("Initializing the collector with ray_init_config")
+    #
+    # distributed_collector = RayCollector(
+    #     create_env_fn=[env_maker] * num_collectors,
+    #     policy=policy,
+    #     frames_per_batch=frames_per_batch,
+    #     total_frames=total_frames,
+    #     sync=False,  # Asynchronous
+    #     num_collectors=num_collectors,
+    #     num_workers_per_collector=num_workers_per_collector,
+    #     remote_configs=remote_configs,
+    #     device=torch.device("cuda"),  # or "cpu"
+    #     ray_init_config=ray_init_config,  # <-- The key line
+    # )
+    #
+    # total_collected = 0
+    # for batch_idx, batch_data in enumerate(distributed_collector, start=1):
+    #     batch_size = batch_data.numel()
+    #     total_collected += batch_size
+    #     torchrl_logger.info(
+    #         f"[Batch {batch_idx}] Received {batch_size:,} frames | "
+    #         f"Total so far: {total_collected:,}/{total_frames:,}"
+    #     )
+    #     if total_collected >= total_frames:
+    #         break
+    #
+    # torchrl_logger.info("Data collection complete!")
+
+    # Define the number of collectors and workers per collector
+    num_collectors = 8
+    workers_per_collector = 8
+    envs = [ParallelEnv(workers_per_collector, env_maker) for _ in range(num_collectors)]
+
+    # Initialize the MultiaSyncDataCollector
+    collector = MultiaSyncDataCollector(
+        create_env_fn=envs,
+        policy=policy,
+        frames_per_batch=5120,
+        total_frames=5120 * 100000,
+        device="cuda",
+        update_at_each_batch=True,
+        split_trajs=True,
     )
 
-    # 2. Define distributed collector
-    remote_config = {
-        "num_cpus": 1,
-        "num_gpus": 0.2,
-        "memory": 5 * 1024**3,
-        "object_store_memory": 2 * 1024**3,
-    }
-    distributed_collector = RayCollector(
-        [env_maker],
-        policy,
-        total_frames=10000,
-        frames_per_batch=200,
-    )
+    solver = RNaDSolver(policy, RNaDConfig(game_name="stratego"))
+    for i, data in enumerate(collector):
+        # Process the collected data
+        # breakpoint()
+        print(f"Batch {i} collected with shape: {data.batch_size}")
+        logs = solver.step(data)
+        print("Loss: " + str(logs["total loss"]) + " Value Loss: " + str(logs["loss_v"]) +
+              " Policy Loss: " + str(logs["loss_nerd"]))
 
-    # Sample batches until reaching total_frames
-    counter = 0
-    num_frames = 0
-    for batch in distributed_collector:
-        counter += 1
-        num_frames += batch.shape.numel()
-        torchrl_logger.info(f"batch {counter}, total frames {num_frames}")
+        if i % 10 == 0:
+            print("################### Evaluating ###################")
+            evaluate_random(policy)
+
+
+    collector.shutdown()
+    for name, param in policy.named_parameters():
+        if param.requires_grad:
+            print(f"{name}: {param.data}")
+    breakpoint()

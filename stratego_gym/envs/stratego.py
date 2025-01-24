@@ -4,6 +4,8 @@ import numpy as np
 from gymnasium import Env, spaces
 import pygame
 
+from stratego_gym.envs.masked_multi_discrete import MaskedMultiDiscrete
+
 '''
 Pieces Encodings: (Negated Encodings represent the other player's pieces)
 '''
@@ -110,7 +112,7 @@ class StrategoEnv(Env):
         self.clock = None
 
         self.observation_space = self._get_observation_space()
-        self.action_space = self._get_action_space()
+        self.action_space = MaskedMultiDiscrete(self.game_map.shape, dtype=np.int64)
 
         if render_mode not in [None, "human", "rgb_array"]:
             raise ValueError(f"Unsupported render_mode: {render_mode}")
@@ -129,7 +131,8 @@ class StrategoEnv(Env):
         })
 
     def _get_action_space(self):
-        return spaces.MultiDiscrete(self.game_map.shape, dtype=np.int64)
+        return self.action_space
+        # return spaces.MultiDiscrete(self.game_map.shape, dtype=np.int64)
 
     def set_player_pieces(self, player1pieces: np.ndarray, player2pieces: np.ndarray):
         self.p1_pieces = player1pieces
@@ -211,6 +214,7 @@ class StrategoEnv(Env):
             action_mask = self.valid_pieces_to_select()
         else:
             action_mask = self.valid_destinations()
+        self.action_space.set_mask(action_mask.astype(bool))
         return {"obs": obs, "action_mask": action_mask}
 
     def get_public_obs(self, public_obs_info, unrevealed):
@@ -271,7 +275,8 @@ class StrategoEnv(Env):
 
         if self.game_phase == DEPLOYMENT_PHASE:
             if self.valid_spots_to_place()[action] == 0:
-                raise ValueError("Invalid Deployment Location")
+                action = tuple(self.action_space.sample())
+                # raise ValueError("Invalid Deployment Location")
 
             if self.player == 1:
                 self.board[action] = self.pieces[self.p1_deploy_idx]
@@ -290,7 +295,8 @@ class StrategoEnv(Env):
 
         elif self.game_phase == SELECTION_PHASE:
             if self.valid_pieces_to_select()[action] == 0:
-                raise ValueError("Invalid Piece Selection")
+                action = tuple(self.action_space.sample())
+                # raise ValueError("Invalid Piece Selection")
 
             if self.player == 1:
                 self.p1_last_selected = action
@@ -310,7 +316,9 @@ class StrategoEnv(Env):
         # Action is a tuple representing a coordinate on the board
         valid, msg = self.check_action_valid(source, dest)
         if not valid:
-            raise ValueError(msg)
+            action = tuple(self.action_space.sample())
+            dest = action
+            # raise ValueError(msg)
 
         # Get Selected Piece Identity and Destination Identity
         selected_piece = self.board[source]

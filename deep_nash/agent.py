@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from tensordict import TensorDictBase
 from tensordict.nn import TensorDictModule
+from torch import Tensor
 
 from deep_nash.network import DeepNashNet
 
@@ -15,7 +16,7 @@ from deep_nash.network import DeepNashNet
 class DeepNashAgent(TensorDictModule):
     def __init__(self, config=None, *args, **kwargs):
         # TODO: Add Loading from the config at some point. Device should also be a part of the config
-        net = DeepNashNet(10, 20, 0, 0) # Default
+        net = DeepNashNet(15, 16, 0, 0) # Default
 
         # Call TensorDictModule constructor
         super().__init__(
@@ -31,19 +32,62 @@ class DeepNashAgent(TensorDictModule):
         tensordict_out: Union[TensorDictBase, None] = None,
         **kwargs: Any,
     ) -> TensorDictBase:
-        # Ensure batch dimensions for obs and action_mask
-        if len(tensordict["obs"].shape) == 3:
-            tensordict["obs"] = tensordict["obs"].unsqueeze(0)
 
-        if len(tensordict["action_mask"].shape) == 2:
-            tensordict["action_mask"] = tensordict["action_mask"].unsqueeze(0)
+        leading_shape = tensordict.shape
+
+        # Ensure batch dimensions for obs and action_mask
+        if len(leading_shape) == 0:
+            tensordict = tensordict.unsqueeze(0)
+
+        if len(leading_shape) > 1:
+            tensordict = tensordict.reshape(-1)
 
         # Call the parent forward method to compute policy logits
         tensordict = super().forward(tensordict)
         shape = tensordict["obs"].shape  # Shape: (B, C, H, W)
 
-        # Sample actions using policy logits
-        sampled_indices = torch.multinomial(tensordict["policy"], num_samples=1, replacement=True)  # Shape: (B, 1)
+        policy = tensordict["policy"]
+        if "collector" in tensordict and "mask" in tensordict["collector"]:
+            valid = tensordict["collector"]["mask"]  # boolean mask
+        else:
+            valid = torch.ones(policy.shape[:-1]).bool()
+
+        # 1. Flatten if there's a complex batch shape
+        #    We'll flatten everything except the last dimension (which is N).
+        #    For example, if policy.shape = (B1, B2, ..., Bk, N),
+        #    flatten_size = B1*B2*...*Bk.
+        original_batch_size = policy.shape[:-1]  # all but the last dim
+        N = policy.shape[-1]
+
+        policy_flat = policy.view(-1, N)  # (flatten_size, N)
+        valid_flat = valid.view(-1)  # (flatten_size,)
+
+        # 2. Identify which entries are valid
+        valid_indices = valid_flat.nonzero(as_tuple=True)[0]  # shape = (#valid,)
+
+        # 3. We'll create a container for the final samples in flattened form.
+        #    shape = (flatten_size, 1) because we sample 1 action index per row.
+        sampled_indices_flat = torch.zeros(
+            (policy_flat.size(0), 1),
+            dtype=torch.long,
+            device=policy_flat.device
+        )
+
+        if len(valid_indices) > 0:
+            # 4. Subset only the valid rows of policy
+            valid_policy: Tensor = policy_flat[valid_indices]  # (#valid, N)
+            assert not (valid_policy.isinf() | valid_policy.isnan()).any()
+
+            # 5. Sample from the subset
+            sampled_valid = torch.multinomial(valid_policy, num_samples=1, replacement=True)
+            # shape = (#valid, 1)
+
+            # 6. Copy those sampled indices back into our container
+            sampled_indices_flat[valid_indices] = sampled_valid
+
+        # 7. Unflatten to original batch shape
+        #    so we get (B1, B2, ..., Bk, 1)
+        sampled_indices = sampled_indices_flat.view(*original_batch_size, 1)
 
         # Convert sampled indices into rows and columns
         rows = sampled_indices // shape[-1]  # Shape: (B, 1)
@@ -68,5 +112,12 @@ class DeepNashAgent(TensorDictModule):
 
         # Add the one-hot encoded action to the TensorDict
         tensordict["action"] = action_onehot
+        tensordict["action_one_hot"] = one_hot_encode(sampled_indices, shape[-2] * shape[-1])
+
+        if len(leading_shape) == 0:
+            tensordict = tensordict.squeeze(0)
+
+        if len(leading_shape) > 1:
+            tensordict = tensordict.view(*leading_shape)
 
         return tensordict

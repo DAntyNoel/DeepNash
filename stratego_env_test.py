@@ -23,7 +23,7 @@ def basic_test():
     start_time = time.time()
     count = 0
     while time.time() - start_time < 60:
-        action = env.unwrapped.get_random_action()
+        action = env.action_space.sample()
         state, reward, terminated, truncated, info = env.step(action)
         env.render()
         time.sleep(0.1)
