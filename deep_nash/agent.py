@@ -16,7 +16,7 @@ from deep_nash.network import DeepNashNet
 class DeepNashAgent(TensorDictModule):
     def __init__(self, config=None, *args, **kwargs):
         # TODO: Add Loading from the config at some point. Device should also be a part of the config
-        net = DeepNashNet(15, 16, 0, 0) # Default
+        net = DeepNashNet(32, 64, 0, 0) # Default
 
         # Call TensorDictModule constructor
         super().__init__(

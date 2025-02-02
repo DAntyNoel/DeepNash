@@ -55,6 +55,7 @@ DEPLOYMENT_PHASE = 0
 SELECTION_PHASE = 1
 MOVEMENT_PHASE = 2
 GAME_OVER = 3
+GAME_PHASE_DICT = {0: "DEPLOYMENT_PHASE", 1: "SELECTION_PHASE", 2: "MOVEMENT_PHASE"}
 
 GAME_CONFIG_4x4 = {
     "game_map": MAP_4x4,
@@ -174,9 +175,10 @@ class StrategoEnv(Env):
     def generate_observation(self):
         if self.game_map.shape == (4, 4):
             obstacles = (np.abs(self.board) == OBSTACLE)[None, :]
+            # TODO Fix the way we generate this
             private_obs = np.concatenate(
                 (self.board[None, :] == FLAG, self.board[None, :] == SPY,
-                 self.board[None, :] == SERGEANT, self.board[None, :] == MARSHAL)
+                 self.board[None, :] == SCOUT, self.board[None, :] == MARSHAL)
             )
 
             if self.game_phase == DEPLOYMENT_PHASE:
@@ -256,11 +258,14 @@ class StrategoEnv(Env):
         - The last selected piece (last_selected). This is only valid if the game phase is MOVEMENT_PHASE,
           and it corresponds to the last piece selected by the current player.
         """
-        return {"cur_player": np.array(self.player), "cur_board": np.copy(self.board), "pieces": self.pieces,
+        board = np.copy(self.board)
+        if self.player == -1:
+            board = np.rot90(board, 2) * -1
+        return {"cur_player": np.array(self.player), "cur_board": board, "pieces": self.pieces,
                 "board_shape": self.board.shape, "num_pieces": len(self.pieces),
                 "total_moves": self.draw_conditions["total_moves"],
                 "moves_since_attack": self.draw_conditions["moves_since_attack"],
-                "game_phase": self.game_phase,
+                "game_phase": np.array(self.game_phase),
                 "last_selected": None if self.game_phase != MOVEMENT_PHASE else
                 self.p1_last_selected if self.player == 1 else self.p2_last_selected}
 

@@ -22,20 +22,23 @@ def basic_test():
 
     start_time = time.time()
     count = 0
+    games = 0
     while time.time() - start_time < 60:
         action = env.action_space.sample()
         state, reward, terminated, truncated, info = env.step(action)
-        env.render()
-        time.sleep(0.1)
+        # env.render()
+        # time.sleep(0.1)
         count += 1
         if terminated:
-            print(f"Game over! Player {-1 * info['cur_player']} received {reward}")
+            games += 1
+            print(f"Game over! Player {-1 * info['cur_player']} received {reward}, game: {games}")
             env.reset()
     print(count)
 
 def policy_test():
     device = "cuda"
-    agent = DeepNashAgent().to(device)
+    # agent = DeepNashAgent().to(device)
+    agent = torch.load("DeepNashPolicy.pt").to(device)
 
     reader = default_info_dict_reader(["cur_player"])
     env = GymEnv("stratego_gym/Stratego-v0", render_mode=None).set_info_dict_reader(reader).to(device)
@@ -46,7 +49,7 @@ def policy_test():
     while time.time() - start_time < 60:
         tensordict = agent(tensordict)
         tensordict = env.step(tensordict)["next"]
-        env.render()
+        # env.render()
         # time.sleep(0.1)
         count += 1
         if tensordict["terminated"]:
@@ -106,6 +109,6 @@ def vectorized_test(n_procs, n_workers):
 
 if __name__ == '__main__':
     # vectorized_test(10, 4)
-    # policy_test()
-    basic_test()
+    policy_test()
+    # basic_test()
     # rollout_test()

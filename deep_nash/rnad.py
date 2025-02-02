@@ -236,7 +236,7 @@ def v_trace(
     assert  player_id.shape == batch.shape
     acting_policy = batch["policy"]
     assert acting_policy.shape == batch.shape + (16,)
-    player_others: torch.Tensor = torch.tensor(2 * (batch["cur_player"] == player) - 1).unsqueeze(-1)
+    player_others: torch.Tensor = torch.tensor(2 * valid * (batch["cur_player"] == player) - 1).unsqueeze(-1)
     actions_oh = batch["action_one_hot"]
     assert actions_oh.shape == batch.shape + (16,)
     reward = batch["next"]["reward"].squeeze(-1) * batch["cur_player"] * player
@@ -468,14 +468,13 @@ class RNaDSolver:
             output = policy(data)
             return output["policy"], output["value"], output["log_probs"], output["logits"]
 
-        batch_prev = batch.clone()
         _, v_target, _, _ = rollout(self.policy_target, batch.clone())
         _, _, log_pi_prev, _ = rollout(self.policy_prev, batch.clone())
         _, _, log_pi_prev_, _ = rollout(self.policy_prev_, batch.clone())
 
         pi, v, log_pi, logit = rollout(self.policy, batch)
 
-        policy_pprocessed = pi
+        policy_pprocessed = pi # TODO
 
         alpha, _ = self._entropy_schedule(self.learner_steps)
         log_policy_reg = log_pi - (alpha * log_pi_prev + (1 - alpha) * log_pi_prev_)
@@ -496,6 +495,14 @@ class RNaDSolver:
             v_target_list.append(v_target_)
             has_played_list.append(has_played)
             v_trace_policy_target_list.append(policy_target_)
+
+        print("#################### V Debugging ######################")
+        print(v[:, 0].squeeze(-1)[batch["collector"]["mask"][:, 0]])
+        print("-------------------------------------------------------")
+        print(v_target_list[0][:, 0].squeeze(-1)[batch["collector"]["mask"][:, 0]])
+        print(v_target_list[1][:, 0].squeeze(-1)[batch["collector"]["mask"][:, 0]])
+        print("-------------------------------------------------------")
+        print(batch["game_phase"][:, 0][batch["collector"]["mask"][:, 0]])
 
         loss_v = get_loss_v([v] * 2, v_target_list, has_played_list)
 
@@ -518,7 +525,6 @@ class RNaDSolver:
         logs["loss_nerd"] = loss_nerd.detach().item()
         logs["total loss"] = (loss_v + loss_nerd).detach().item()
 
-        print(v[0][:, 0])
         return loss_v + loss_nerd, logs
 
     def step(self, batch):

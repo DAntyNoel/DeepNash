@@ -12,8 +12,7 @@ from torchrl.envs.libs.gym import GymEnv
 
 from deep_nash.network import PyramidModule, ConvResBlock, DeconvResBlock
 from deep_nash.rnad import RNaDSolver, RNaDConfig
-
-
+from stratego_gym.envs.stratego import GAME_PHASE_DICT, DEPLOYMENT_PHASE, MOVEMENT_PHASE
 
 # If deep_nash is an installable package, you can do:
 # ray_init_config = {"runtime_env": {"pip": ["deep_nash"]}}
@@ -33,27 +32,50 @@ from deep_nash import DeepNashAgent  # must be importable on the driver side too
 
 # 1. Create environment factory
 def env_maker(render_mode=None):
-    reader = default_info_dict_reader(["cur_player"])
-    return GymEnv("stratego_gym/Stratego-v0", render_mode=render_mode).set_info_dict_reader(reader)
+    reader = default_info_dict_reader(["cur_player", "game_phase"])
+    return GymEnv("stratego_gym/Stratego-v0", render_mode=None).set_info_dict_reader(reader)
 
+@torch.inference_mode
 def evaluate_random(policy: TensorDictModule):
     env = env_maker().to("cuda")
-    count = 0
-    for _ in range(100):
+    env.set_info_dict_reader(default_info_dict_reader(["cur_player", "game_phase", "cur_board"]))
+    win_count = 0
+    draw_count = 0
+    for i in range(100):
         tensordict = env.reset()
-        policy_turn = np.random.choice([True, False])
+        policy_turn = np.random.choice([1, -1])
+        print(f"New Game! {i}")
         while True:
-            if policy_turn:
+            if i < 10: print("------------------------")
+            if i < 10: print(f"Game Phase: {GAME_PHASE_DICT[tensordict['game_phase'].item()]}")
+            if i < 10: print(f"Cur Player: {tensordict['cur_player'].item()}")
+            game_phase = tensordict['game_phase'].item()
+
+            if tensordict["cur_player"] == policy_turn:
                 tensordict = policy(tensordict)
+                if i < 10: print(f"Value: {tensordict['value'].item()}")
+                if i < 10: print(tensordict["policy"])
                 tensordict = env.step(tensordict)["next"]
             else:
+                if i < 10: print("Random Action")
                 tensordict["action"] = env.action_spec.sample()
                 tensordict = env.step(tensordict)["next"]
+
+            if game_phase in (DEPLOYMENT_PHASE, MOVEMENT_PHASE):
+                if i < 10: print(tensordict["cur_board"])
+
             if tensordict["terminated"]:
-                count += int(policy_turn)
+                if i < 10: print(f"Won Game? {-policy_turn == tensordict['cur_player']}")
+                if i < 10: print(f"Draw Game? {(tensordict['reward'] == 0).item()}")
+                win_count += int(-policy_turn == tensordict["cur_player"]) * tensordict["reward"].item()
+                draw_count += 1 - tensordict["reward"].item()
                 break
 
-    print(f"Win Rate against Random: {count / 100}")
+    env.close()
+
+    print(f"Win Rate against Random: {win_count / 100}")
+    print(f"Draw Rate against Random: {draw_count / 100}")
+    print(f"Loss Rate against Random: {(100 - (win_count + draw_count)) / 100}")
 
     # env = env_maker(render_mode="human").to("cuda")
     # tensordict = env.reset()
@@ -78,7 +100,8 @@ if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(True)
 
     # 2. Define a policy
-    policy = DeepNashAgent()
+    # policy = DeepNashAgent()
+    policy = torch.load("DeepNashPolicy.pt").cpu()
     env = env_maker()
     policy(env.reset())
     policy.to("cuda")
@@ -127,12 +150,12 @@ if __name__ == "__main__":
     # torchrl_logger.info("Data collection complete!")
 
     # Define the number of collectors and workers per collector
-    num_collectors = 8
-    workers_per_collector = 8
+    num_collectors = 6
+    workers_per_collector = 6
     envs = [ParallelEnv(workers_per_collector, env_maker) for _ in range(num_collectors)]
 
     # Initialize the MultiaSyncDataCollector
-    collector = MultiaSyncDataCollector(
+    collector = MultiaSyncDataCollector (
         create_env_fn=envs,
         policy=policy,
         frames_per_batch=5120,
@@ -146,14 +169,18 @@ if __name__ == "__main__":
     for i, data in enumerate(collector):
         # Process the collected data
         # breakpoint()
+        print("###############################################################")
+        print("###############################################################")
+        print("###############################################################")
         print(f"Batch {i} collected with shape: {data.batch_size}")
         logs = solver.step(data)
         print("Loss: " + str(logs["total loss"]) + " Value Loss: " + str(logs["loss_v"]) +
               " Policy Loss: " + str(logs["loss_nerd"]))
 
-        if i % 10 == 0:
+        if (i+1) % 100 == 0:
             print("################### Evaluating ###################")
             evaluate_random(policy)
+            torch.save(policy, "DeepNashPolicy.pt")
 
 
     collector.shutdown()
