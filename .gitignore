@@ -3,3 +3,7 @@ stratego_gym/stratego_gym.egg-info
 __pycache__
 .idea
 *.tar.gz
+
+test*
+debug*
+result*

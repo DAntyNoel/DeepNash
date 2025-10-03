@@ -4,13 +4,14 @@ from random import random
 import numpy as np
 import torch
 from torch import nn
+import torch.multiprocessing as mp
 from tensordict.nn import TensorDictModule
 from torchrl.collectors import MultiaSyncDataCollector, SyncDataCollector, MultiSyncDataCollector
 from torchrl.collectors.distributed import RayCollector
 from torchrl.envs import default_info_dict_reader, ParallelEnv
 from torchrl.envs.libs.gym import GymEnv
 
-from deep_nash.network import PyramidModule, ConvResBlock, DeconvResBlock
+from deep_nash.network import PyramidModule, ConvResBlock, DeconvResBlock, DeepNashNet
 from deep_nash.rnad import RNaDSolver, RNaDConfig
 from stratego_gym.envs.stratego import GAME_PHASE_DICT, DEPLOYMENT_PHASE, MOVEMENT_PHASE
 
@@ -98,13 +99,15 @@ def evaluate_random(policy: TensorDictModule):
 
 if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(True)
+    mp.set_start_method("spawn", force=True)
 
     # 2. Define a policy
     # policy = DeepNashAgent()
-    policy = torch.load("DeepNashPolicy.pt").cpu()
+    policy:DeepNashNet = torch.load("DeepNashPolicy.pt", weights_only=False).cpu()
     env = env_maker()
     policy(env.reset())
     policy.to("cuda")
+    # policy.share_memory()
 
     # # Choose how many remote collectors and vectorized envs you want
     # num_collectors = 1
@@ -150,17 +153,17 @@ if __name__ == "__main__":
     # torchrl_logger.info("Data collection complete!")
 
     # Define the number of collectors and workers per collector
-    num_collectors = 6
-    workers_per_collector = 6
+    num_collectors = 1
+    workers_per_collector = 1
     envs = [ParallelEnv(workers_per_collector, env_maker) for _ in range(num_collectors)]
 
     # Initialize the MultiaSyncDataCollector
-    collector = MultiaSyncDataCollector (
+    collector = MultiSyncDataCollector (
         create_env_fn=envs,
         policy=policy,
-        frames_per_batch=5120,
-        total_frames=5120 * 100000,
-        device="cuda",
+        frames_per_batch=512,
+        total_frames=512 * 100,
+        device="cpu",
         update_at_each_batch=True,
         split_trajs=True,
     )
@@ -173,6 +176,7 @@ if __name__ == "__main__":
         print("###############################################################")
         print("###############################################################")
         print(f"Batch {i} collected with shape: {data.batch_size}")
+        data = data.to("cuda")
         logs = solver.step(data)
         print("Loss: " + str(logs["total loss"]) + " Value Loss: " + str(logs["loss_v"]) +
               " Policy Loss: " + str(logs["loss_nerd"]))

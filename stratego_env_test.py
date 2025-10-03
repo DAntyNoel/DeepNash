@@ -38,7 +38,7 @@ def basic_test():
 def policy_test():
     device = "cuda"
     # agent = DeepNashAgent().to(device)
-    agent = torch.load("DeepNashPolicy.pt").to(device)
+    agent = torch.load("DeepNashPolicy.pt", weights_only=False).to(device)
 
     reader = default_info_dict_reader(["cur_player"])
     env = GymEnv("stratego_gym/Stratego-v0", render_mode=None).set_info_dict_reader(reader).to(device)
